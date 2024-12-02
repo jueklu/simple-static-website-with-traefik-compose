@@ -1,0 +1,86 @@
+### Variables
+variables:
+  DEPLOY_IP: "192.168.70.6"  # Deployment server IP
+  DEPLOY_USER: "gitlab-deployment"  # Deployment server SSH user
+
+  # Define the image name for Apache, tagging it with the GitLab CI registry and the current commit SHA
+  APACHE_IMAGE_SHA: $CI_REGISTRY_IMAGE/apache:$CI_COMMIT_SHA
+  # Define the image name for Traefik, tagging it with the GitLab CI registry and the current commit SHA
+  TRAEFIK_IMAGE_SHA: $CI_REGISTRY_IMAGE/traefik:$CI_COMMIT_SHA
+
+
+### Stages
+stages:
+  - build
+  - deploy
+
+
+### Build Apacher Container
+build-apache:
+  stage: build
+  image: docker:20.10.16
+  variables:
+    DOCKER_DRIVER: overlay2
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  services:
+    - docker:20.10.16-dind
+  before_script:
+    # Log in to the GitLab Container registry using CI credentials
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker pull $CI_REGISTRY_IMAGE/apache:latest || true
+    # Build the Apache Docker image / enable caching from the previously pulled image / tag the new image with the current commit SHA and as "latest"
+    - docker build -f Dockerfiles/Dockerfile-Apache --cache-from $CI_REGISTRY_IMAGE/apache:latest --tag $APACHE_IMAGE_SHA --tag $CI_REGISTRY_IMAGE/apache:latest .
+    # Push the newly built image to the GitLab Container registry
+    - docker push $APACHE_IMAGE_SHA
+    # Push the image tagged as "latest" to the GitLab Container registry
+    - docker push $CI_REGISTRY_IMAGE/apache:latest
+
+
+### Build Traefik Container
+build-traefik:
+  stage: build
+  image: docker:20.10.16
+  variables:
+    DOCKER_DRIVER: overlay2
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  services:
+    - docker:20.10.16-dind
+  before_script:
+    # Log in to the GitLab Container registry using CI credentials
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker pull $CI_REGISTRY_IMAGE/traefik:latest || true
+    # Build the Traefik Docker image / enable caching from the previously pulled image / tag the new image with the current commit SHA and as "latest"
+    - docker build -f Dockerfiles/Dockerfile-Traefik --cache-from $CI_REGISTRY_IMAGE/traefik:latest --tag $TRAEFIK_IMAGE_SHA --tag $CI_REGISTRY_IMAGE/traefik:latest .
+    # Push the newly built image to the GitLab Container registry
+    - docker push $TRAEFIK_IMAGE_SHA
+    # Push the image tagged as "latest" to the GitLab Container registry
+    - docker push $CI_REGISTRY_IMAGE/traefik:latest
+
+
+### Deploy Containers to Virtual Machine
+deploy_compose_stack:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    # Update the package index, install OpenSSH client and gettext for envsubst
+    - apk update && apk add openssh-client gettext
+    # If the private SSH key file ($ID_RSA) exists, set secure permissions (read/write for the owner only)
+    - if [ -f "$ID_RSA" ]; then chmod og= $ID_RSA; fi
+  script:
+    # SSH into the deployment server, log in to the GitLab Container registry
+    - ssh -i $ID_RSA -o StrictHostKeyChecking=no $DEPLOY_USER@$DEPLOY_IP "docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY"
+    # Substitute environment variables in the Docker Compose template to generate final Docker Compose file
+    - envsubst < Docker-Compose/docker-compose-apache-traefik.tmpl > docker-compose-apache-traefik.yml
+    # Copy generated Docker Compose file to the deployment server
+    - scp -i $ID_RSA -o StrictHostKeyChecking=no docker-compose-apache-traefik.yml $DEPLOY_USER@$DEPLOY_IP:/tmp
+    # SSH into the deployment server, stop any running containers defined in the Docker Compose file
+    - ssh -i $ID_RSA -o StrictHostKeyChecking=no $DEPLOY_USER@$DEPLOY_IP "cd /tmp; docker compose -f docker-compose-apache-traefik.yml down"
+    # SSH into the deployment server, start the containers defined in the Docker Compose file
+    - ssh -i $ID_RSA -o StrictHostKeyChecking=no $DEPLOY_USER@$DEPLOY_IP "cd /tmp; docker compose -f docker-compose-apache-traefik.yml up -d"
+  rules:
+    # Rule: Run this job only for main branch
+    - if: $CI_COMMIT_BRANCH == "main"
